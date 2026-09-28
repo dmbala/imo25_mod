@@ -1,0 +1,128 @@
+# The IMO solver pipeline.
+#
+#   solve -> improve -> extract -> verify -> judge -> check -> decide
+#                                    ^                          |
+#                                    +-- correct <- bugreport <- penalize
+#
+# Not a DAG: judge -> ... -> verify is a real cycle, and the run ends on a
+# guard (accept/fail), not on running out of nodes.
+
+start: solve
+max_steps: 400
+
+# Initial counters. streak starts at 1, matching correct_count = 1 in the
+# original agent.py before its loop begins.
+#
+# In counter updates below, a relative change MUST be quoted -- "+1" is a bump,
+# while a bare +1 is YAML for the integer 1 and would assign instead.
+counters:
+  streak: 1
+  errors: 0
+  iterations: 0
+
+nodes:
+  solve:
+    type: chat
+    reset: true
+    system: solve_system
+    messages:
+      - {role: user, text: "{problem}"}
+      - {role: user, each: other_prompts}
+    into: solution
+    next: improve
+
+  improve:
+    type: chat
+    reset: false                      # continues the solver's own conversation
+    messages:
+      - {role: assistant, text: "{solution}"}
+      - {role: user, prompt: self_improve}
+    into: solution
+    next: extract
+
+  extract:
+    type: transform
+    fn: split
+    source: solution
+    marker: "Detailed Solution"
+    keep: after
+    into: detailed
+    next: verify
+
+  verify:
+    type: chat
+    reset: true                       # fresh conversation, grader persona
+    system: verify_system
+    messages:
+      - {role: user, prompt: verify_user}
+    into: verification
+    next: judge
+
+  judge:
+    type: classify
+    messages:
+      - {role: user, prompt: judge}
+    into: verdict
+    match:
+      "yes": "yes"
+      default: "no"
+    edges:
+      "yes": {counters: {streak: "+1", errors: 0}, next: check}
+      "no": {next: check}
+
+  check:
+    type: guard
+    counters: {iterations: "+1"}
+    accept_if: "streak >= 5"
+    fail_if: "errors >= 10 or iterations >= 30"
+    next: decide
+
+  # The errors counter is bumped on the way *into* a correction, so the
+  # fail_if above is only tested after the following verify -- which is what
+  # the original loop does by incrementing at the top and checking at the end.
+  decide:
+    type: guard
+    when:
+      - {if: "verdict_label == 'no'", next: penalize}
+    next: verify
+
+  penalize:
+    type: guard
+    counters: {streak: 0, errors: "+1"}
+    next: bugreport
+
+  bugreport:
+    type: transform
+    fn: split
+    source: verification
+    marker: "Detailed Verification"
+    keep: before
+    into: bug_report
+    next: correct
+
+  correct:
+    type: chat
+    reset: true
+    system: solve_system
+    messages:
+      - {role: user, text: "{problem}"}
+      - {role: user, each: other_prompts}
+      - {role: assistant, text: "{solution}"}
+      - {role: user, prompt: correction, text: "{bug_report}"}
+    into: solution
+    next: extract
+
+  # The upstream authors wrote a "re-review the bug report" step and then
+  # commented it out (agent.py:398-415, prompt at :165). Here it is a node:
+  # point judge's "no" edge at it to run the experiment.
+  #
+  # recheck:
+  #   type: chat
+  #   reset: true
+  #   system: verify_system
+  #   messages:
+  #     - {role: user, prompt: verify_user}
+  #     - {role: assistant, text: "{verification}"}
+  #     - {role: user, prompt: check_verification}
+  #   into: verification
+  #   next: judge
